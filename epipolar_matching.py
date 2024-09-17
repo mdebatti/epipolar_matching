@@ -178,7 +178,7 @@ def demoViewPics():
 def demoDrawEpilines():
     # Draw epilines
     eg = EpipolarGeometry(showImages=False)
-    eg.drawStereoEpilines(method='ORB')  # method='SIFT' (default) or method='ORB'
+    eg.drawStereoEpilines(method='SIFT')  # method='SIFT' (default) or method='ORB'
 
 if __name__ == "__main__":
     #demoViewPics()
