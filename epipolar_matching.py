@@ -7,8 +7,10 @@ class EpipolarGeometry:
     def __init__(self, showImages):
         # Load images
         root = os.getcwd()
-        imgLeftPath = os.path.join(root, 'demoImages/image_l.jpg')
-        imgRightPath = os.path.join(root, 'demoImages/image_r.jpg')
+        imgLeftPath = os.path.join(root, 'demoImages/image_left.png')
+        imgRightPath = os.path.join(root, 'demoImages/image_right.png')
+        #imgLeftPath = os.path.join(root, 'demoImages/image_l.jpg')
+        #imgRightPath = os.path.join(root, 'demoImages/image_r.jpg')
         #imgLeftPath = os.path.join(root, 'demoImages/image1.png')
         #imgRightPath = os.path.join(root, 'demoImages/image2.png')
 
@@ -48,14 +50,18 @@ class EpipolarGeometry:
             kpLeft, desLeft = sift.detectAndCompute(self.imgLeft, mask)
             kpRight, desRight = sift.detectAndCompute(self.imgRight, mask)
 
-            # Use FLANN-based matcher for SIFT
-            FLANN_INDEX_KDTREE = 1
-            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-            search_params = dict(checks=50)
+            # Use FLANN-based (Fast Library for Approximate Nearest Neighbors) matcher for SIFT
+            FLANN_INDEX_KDTREE = 1  # use a  KD-Tree algorithm
+            num_trees = 5           # Number of trees used in the KD-tree (more increases precision but slower)
+            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees = num_trees)
+            search_params = dict(checks=50) # number of checks, increase for accuracy at the cost of speed
             flann = cv.FlannBasedMatcher(index_params, search_params)
+
+            # FInding matches between descriptor (for each descriptor in desLeft, find 2 nearest matches from desRight)
             matches = flann.knnMatch(desLeft, desRight, k=2)
 
             # If using SIFT, we need to apply the ratio test as per Lowe's paper
+            # (a good match should have a significantly closer match compared to the second-best match)
             good_matches = []
             for m, n in matches:
                 if m.distance < 0.8 * n.distance:
@@ -85,23 +91,65 @@ class EpipolarGeometry:
             kpLeft, desLeft = orb.detectAndCompute(self.imgLeft, None)
             kpRight, desRight = orb.detectAndCompute(self.imgRight, None)
 
-            # Use BFMatcher with Hamming distance for ORB
+            # Use BFMatcher (Brute Force) with Hamming distance for ORB
+            # check that if left matches right, right also matches left
             bf = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
+
+            # list of matches, each contains (1) queryIdx (index of desLeft, i.e query)
+            # (2) trainIdx (index of desRight, i.e train), (3) distance (hamming distance)
             matches = bf.match(desLeft, desRight)
 
             # Sort matches by distance (best matches first)
             good_matches = sorted(matches, key=lambda x: x.distance)
 
         else:
-
             raise ValueError(f"Unknown method '{method}'. Please use 'SIFT' or 'ORB'.")
         
-        # Extract points based on good matches
+        # Extract coordinates of keypoints based on good matches
+        # kpLeft/kpRights are tuples of openCV KeyPoint objects. 
+        # each keypoint object kp has an attribute pt which is a (x,y) tuple 
+        # representing coordinate of that keypoint in the image
+        # 2D NumPy arrays of shape (N, 2), where N is the number of good matches, 
+        # and each row contains the coordinates (x, y) of a keypoint
         ptsLeft = np.float32([kpLeft[m.queryIdx].pt for m in good_matches])
         ptsRight = np.float32([kpRight[m.trainIdx].pt for m in good_matches])
 
-        # Calculate the fundamental matrix
+        # 1. The fundamental matrix (F) encodes the relationship between corresponding points in two views (images).
+        #    For points (x1, y1) in the left image and (x2, y2) in the right, the relation is: p2.T * F * p1 = 0.
+        #    p1 and p2 are the homogeneous coordinates of the points in the left and right images, respectively.
+
+        # 2. Purpose of F:
+        #    - Maps points to epipolar lines between images.
+        #    - Used in stereo calibration, image rectification, and 3D scene reconstruction.
+
+        # 3. Code:
+        #    F, mask = cv.findFundamentalMat(ptsLeft, ptsRight, cv.FM_LMEDS)
+        #    - Inputs: 
+        #      ptsLeft, ptsRight: 2D arrays with keypoint coordinates in left and right images.
+        #      cv.FM_LMEDS: Least Median of Squares, robust to outliers.
+        #    - Outputs: 
+        #      F: 3x3 fundamental matrix encoding epipolar geometry.
+        #      mask: Indicates inliers (1) and outliers (0) in the point correspondences.
+
+        # 4. Inside cv.findFundamentalMat():
+        #    - It estimates F by minimizing errors for inliers, ignoring outliers.
+        #    - cv.FM_LMEDS focuses on minimizing median squared residuals.
+
+        # 5. Usage of F:
+        #    - Epipolar lines: Compute corresponding lines in the other image.
+        #    - Image rectification: Align stereo images to make corresponding points lie on the same horizontal line.
+        #    - Depth estimation: Reconstruct 3D structure via stereo triangulation.
+
+        # 6. Estimation methods:
+        #    - cv.FM_LMEDS: Robust to outliers using Least Median of Squares.
+        #    - cv.FM_RANSAC: Randomly samples points to estimate F, also robust to outliers.
+        #    - cv.FM_8POINT: Requires 8 points, works well in noise-free data but less robust to outliers.
         F, mask = cv.findFundamentalMat(ptsLeft, ptsRight, cv.FM_LMEDS)
+
+        # Evalutate quality of Fundamental matrix
+        self.check_epipolar_constraint(F, ptsLeft, ptsRight)
+        self.check_inlier_ratio(mask)
+        self.check_residuals(F, ptsLeft, ptsRight)
 
         # Extract inliers (good points)
         ptsLeft = ptsLeft[mask.ravel() == 1]
@@ -170,10 +218,99 @@ class EpipolarGeometry:
             cv.circle(img2_color, pt2, 5, color, -1)
 
         return img1_color, img2_color
+    
+    def check_epipolar_constraint(self, F, ptsLeft, ptsRight):
+        """
+        The fundamental matrix (F) encodes the epipolar constraint between two images.
+        The constraint is tested by checking if: p2.T * F * p1 ≈ 0, where:
+            - p1 = [x1, y1, 1].T is a point in the left image (homogeneous coordinates).
+            - p2 = [x2, y2, 1].T is the corresponding point in the right image (homogeneous coordinates).
+            - F is the 3x3 fundamental matrix.
 
-def demoViewPics():
-    # See pictures
-    eg = EpipolarGeometry(showImages=True)
+        The error for each point pair is calculated as the absolute value of p2.T * F * p1.
+        If F is correct, the errors should be small (close to 0).
+
+        Example code:
+            - ptsLeft_h and ptsRight_h: Points converted to homogeneous coordinates.
+            - For each pair, the error is computed and stored.
+            - The average error gives an indication of how well the fundamental matrix satisfies the epipolar constraint.
+        """
+        ptsLeft_h = np.hstack((ptsLeft, np.ones((ptsLeft.shape[0], 1))))
+        ptsRight_h = np.hstack((ptsRight, np.ones((ptsRight.shape[0], 1))))
+        
+        errors = []
+        for i in range(len(ptsLeft)):
+            error = np.abs(np.dot(ptsRight_h[i], np.dot(F, ptsLeft_h[i].T)))
+            errors.append(error)
+        
+        avg_error = np.mean(errors)
+        print("Average epipolar constraint error:", avg_error)
+        return avg_error
+
+
+    def check_inlier_ratio(self, mask):
+        """
+        The mask returned by cv.findFundamentalMat() indicates which point correspondences are inliers (valid points).
+        - Points with a mask value of 1 are considered inliers, and 0 are outliers.
+
+        To verify the quality of the fundamental matrix (F):
+        - Check the ratio of inliers to total points.
+        - A high inlier ratio (e.g., > 0.5) suggests that F is a good fit for the majority of points.
+
+        Example code:
+        - inlier_ratio: The proportion of valid points (inliers) to total points.
+        - A higher inlier ratio indicates that the fundamental matrix is reliable.
+        """
+
+        inlier_ratio = np.sum(mask) / len(mask)
+        print(f"Inlier ratio: {inlier_ratio:.2f}")
+        return inlier_ratio
+
+    def point_line_distance(self, pt, line):
+        """Compute the distance between a point and a line."""
+        a, b, c = line
+        x, y = pt
+        return abs(a * x + b * y + c) / np.sqrt(a**2 + b**2)
+
+    def check_residuals(self, F, ptsLeft, ptsRight):
+        """
+        To quantify how well the points satisfy the epipolar constraint, compute the distance from each point 
+        to its corresponding epipolar line. A small residual error (distance) suggests that the fundamental matrix (F) is accurate.
+
+        Function:
+        - point_line_distance: Computes the distance from a point to a line using the line equation ax + by + c = 0.
+        
+        Example usage:
+        - Residuals are the distances from points to epipolar lines in both images.
+        - Low average residuals indicate that the fundamental matrix fits the data well.
+
+        Threshold:
+        - There is no fixed universal threshold for residuals, but typically, values below 1 pixel suggest a good fit.
+        This can vary depending on the noise level in the data and the precision of the point correspondences.
+        """
+        
+        # Compute epipolar lines in the right image
+        linesRight = cv.computeCorrespondEpilines(ptsLeft.reshape(-1, 1, 2), 1, F)
+        linesRight = linesRight.reshape(-1, 3)
+        
+        # Compute epipolar lines in the left image
+        linesLeft = cv.computeCorrespondEpilines(ptsRight.reshape(-1, 1, 2), 2, F)
+        linesLeft = linesLeft.reshape(-1, 3)
+        
+        # Compute residuals (point-to-line distance)
+        residuals = []
+        for i in range(len(ptsLeft)):
+            residuals.append(self.point_line_distance(ptsRight[i], linesRight[i]))
+            residuals.append(self.point_line_distance(ptsLeft[i], linesLeft[i]))
+        
+        avg_residual = np.mean(residuals)
+        print("Average point-to-epipolar-line distance:", avg_residual)
+        return avg_residual
+
+
+    def demoViewPics():
+        # See pictures
+        eg = EpipolarGeometry(showImages=True) 
 
 def demoDrawEpilines():
     # Draw epilines
